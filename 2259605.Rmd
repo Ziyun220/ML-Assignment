@@ -1,0 +1,251 @@
+---
+title: "2259605"
+author: "2259605"
+date: "2023-08-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Decision Tree
+## Load required library
+```{r}
+library(readr)
+library (tidyverse)
+library(dplyr)
+library(ggplot2)
+library(tidymodels)
+library(C50) # For direct call of C5.0
+library(rpart.plot)
+library(vip)
+options(width=120)
+```
+
+## Clean the data
+```{r}
+succession <- read_csv("family firm CEOs.csv")
+succession <- na.omit(succession)
+succession$famtyp <- as.factor(succession$famtyp)
+succession$famstyle <- as.factor(succession$famstyle)
+succession$ceopattern<- as.factor(succession$ceopattern)
+succession$duality <- as.factor(succession$duality)
+succession$ceo_fam <- as.factor(succession$ceo_fam)
+
+succession <- succession %>%
+  select(-symbol, ,-ceoname, -beceo, -tenure)
+summary(succession)
+
+ggplot(succession, aes(x=ceo_fam, fill=ceo_fam)) +
+     geom_bar() +
+     scale_fill_manual(values=c("red", "blue"))   # visualize the succession proportion
+
+
+```
+
+## Basic decision tree
+```{r}
+# Spliting the data
+succession <- as_tibble(succession) %>%
+    mutate(ceo_fam=as.factor(ceo_fam))
+succession
+
+set.seed(123)
+succession.split <- initial_split(succession, prop=7/10, strata=ceo_fam)
+nrow(training(succession.split))
+nrow(testing(succession.split))
+
+# Recipe
+succession.recipe <- recipe(ceo_fam ~ ., data = training(succession.split))
+
+# Make a model object
+succession.c50 <- decision_tree(
+    mode="classification", 
+    engine="C5.0"
+)
+
+# Fit the model object using the training data
+succession.fit <- succession.c50 %>% fit(ceo_fam~., data=training(succession.split))
+
+# Evaluate the model by making predictions for the testing data
+succession.testing.predictions <- succession.fit %>% 
+    predict(testing(succession.split)) %>%
+    bind_cols(testing(succession.split)) 
+succession.testing.predictions %>% top_n(10)
+
+# Produce a contingency table
+succession.testing.predictions %>%
+    specify(ceo_fam~.pred_class, success="family") %>%
+    table()
+
+# Produce summary statistics for the contingency table
+succession.testing.predictions %>% metrics(truth=ceo_fam, estimate=.pred_class)
+```
+## Improving Performance
+
+### _Tuning_ a Decision Tree
+```{r}
+# Model specification
+tune.spec <- 
+	decision_tree(
+		cost_complexity = tune(),
+		tree_depth = tune()
+	) %>% 
+	set_engine("rpart") %>% 
+	set_mode("classification")
+tune.spec
+
+# Grid of parameters over which I tune
+tree.grid <- grid_regular(
+	cost_complexity(),
+	tree_depth(),
+	levels = 5)
+tree.grid
+
+# Create the cross-validation folds
+set.seed(123)
+succession.folds <- vfold_cv(training(succession.split))
+
+# Make a workflow, bundling a model specification and a recipe (here only a formula)
+tree.workflow <- workflow() %>%
+	add_model(tune.spec) %>%
+	add_formula(ceo_fam ~ .)
+
+# Use tune_grid() to actually fit the models
+tree.results <-
+	tree.workflow %>%
+	tune_grid(
+		resamples = succession.folds,
+		grid = tree.grid
+		)
+
+# Collect the results together
+tree.results %>%
+	collect_metrics()
+
+# Show the five most accurate models
+tree.results %>%
+	show_best("accuracy")
+
+# Take the most accurate
+best.tree <- tree.results %>%
+	select_best("accuracy")
+best.tree
+
+# Take the best parameters and add them to the tree workflow 
+final.workflow <- 
+	tree.workflow %>% 
+	finalize_workflow(best.tree)
+final.workflow
+
+# Use last_fit() to train the finalised model on the whole training dataset and evaluates in on the test holdout data
+final.fit <- 
+	final.workflow %>%
+	last_fit(succession.split) 
+
+# Look at performance of best model
+final.fit %>%
+	collect_metrics()
+
+final.fit %>%
+	collect_predictions() %>% 
+	roc_curve(ceo_fam, .pred_family) %>% 
+	autoplot()
+
+# Extract and visualise the best tree
+final.tree <- extract_workflow(final.fit)
+final.tree %>%
+	extract_fit_engine() %>%
+	rpart.plot(roundint = FALSE)
+```
+### _Boosting_ a Decision Tree
+```{r}
+# Make a model object
+succession.c50.boosted <- boost_tree(
+    mode="classification", 
+    engine="C5.0",
+	trees=80
+)
+
+# Fit the model object using the training data
+succession.c50.boosted.fit <- succession.c50.boosted %>% fit(ceo_fam~., data=training(succession.split))
+
+# Evaluate the model by making predictions for the testing data
+succession.testing.predictions <- succession.c50.boosted.fit %>% 
+    predict(testing(succession.split)) %>%
+    bind_cols(testing(succession.split)) 
+succession.testing.predictions %>% top_n(10)
+
+# Produce a contingency table
+succession.testing.predictions %>%
+    specify(ceo_fam~.pred_class, success="family") %>%
+    table()
+
+# Produce summary statistics for the contingency table
+succession.testing.predictions %>% metrics(truth=ceo_fam, estimate=.pred_class)
+```
+
+# Random forest
+```{r}
+set.seed(123)
+
+# Model specification
+tune.spec <- rand_forest(
+	mtry=tune(),
+	trees=1000,
+	min_n=tune()
+) %>%
+	set_mode("classification") %>%
+	set_engine("ranger")
+
+# Recipe
+tune.recipe <- recipe(ceo_fam~., data =training(succession.split))
+
+# Workflow
+tune.workflow <- workflow() %>%
+	add_recipe(tune.recipe) %>% 
+	add_model(tune.spec)
+
+# Default 10-fold cross validation on training data
+succession.folds <- vfold_cv(training(succession.split))
+
+# Tune
+doParallel::registerDoParallel()
+tune.results <- tune_grid(
+	tune.workflow,
+	resamples=succession.folds,
+	grid=20
+)
+tune.results %>% collect_metrics()
+
+# Select the best model
+best <- select_best(tune.results, "roc_auc")
+final.model <- finalize_model(
+	tune.spec,
+	best
+)
+final.model
+
+# Performance of final model
+final.workflow <- workflow() %>%
+	add_recipe(tune.recipe) %>%
+	add_model(final.model)
+# last_fit() trains on all of the training data and then evaluate on test data
+final.result <- final.workflow %>%
+	last_fit(succession.split)
+final.result %>% collect_metrics()
+
+# Variable importance
+final.model %>%
+	set_engine("ranger", importance="permutation") %>%
+	fit(ceo_fam~., data=training(succession.split)) %>%
+	vip(geom="point")
+```
+
+
+
+
+
+
+
